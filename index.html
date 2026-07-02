@@ -928,17 +928,67 @@
         // 默认管理密码（修改此处即可更换密码）
         const DEFAULT_ADMIN_PWD = '260129';
 
+        // ===== Firebase 实时数据库配置（实现跨设备库存同步） =====
+        // 1. 访问 https://firebase.google.com 创建项目
+        // 2. 左侧菜单选 "Realtime Database" → "创建数据库"
+        // 3. 选 "测试模式"（允许读写），复制数据库 URL 填入下方
+        // 4. 部署后所有人扫码抽奖都会实时同步库存
+        const FIREBASE_URL = 'https://flash-birthday-default-rtdb.asia-southeast1.firebasedatabase.app'; // 填入你的 URL，例如 'https://your-project-default-rtdb.firebaseio.com'
+
         let prizeData = [];
         let drawHistory = [];
         let isDrawing = false;
         const isPublicMode = new URLSearchParams(window.location.search).get('mode') === 'lottery';
 
+        // ==================== Firebase 实时同步 ====================
+        async function syncFromFirebase() {
+            if (!FIREBASE_URL) return;
+            try {
+                const resp = await fetch(`${FIREBASE_URL}/prizes.json?_=${Date.now()}`);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                if (data && Array.isArray(data) && data.length === prizeData.length) {
+                    data.forEach((item, i) => {
+                        if (prizeData[i] && item) {
+                            if (item.currentStock !== undefined) prizeData[i].currentStock = item.currentStock;
+                            if (item.totalStock !== undefined) prizeData[i].totalStock = item.totalStock;
+                            if (item.weight !== undefined) prizeData[i].weight = item.weight;
+                        }
+                    });
+                    saveData();
+                } else if (FIREBASE_URL) {
+                    // Firebase 首次无数据，初始化写入
+                    await syncToFirebase();
+                }
+            } catch (e) {
+                console.warn('Firebase 读取失败:', e);
+            }
+        }
+
+        async function syncToFirebase() {
+            if (!FIREBASE_URL) return;
+            try {
+                const payload = prizeData.map(p => ({
+                    id: p.id,
+                    currentStock: p.currentStock,
+                    totalStock: p.totalStock,
+                    weight: p.weight
+                }));
+                await fetch(`${FIREBASE_URL}/prizes.json`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            } catch (e) {
+                console.warn('Firebase 写入失败:', e);
+            }
+        }
+
         // 初始化数据
-        function initData() {
+        async function initData() {
             const saved = localStorage.getItem(STORAGE_KEY);
             if (saved) {
                 prizeData = JSON.parse(saved);
-                // 检查是否有新图片
                 if (prizeData.length < PRIZE_IMAGES.length) {
                     for (let i = prizeData.length; i < PRIZE_IMAGES.length; i++) {
                         prizeData.push({
@@ -963,6 +1013,9 @@
                 }));
                 saveData();
             }
+
+            // 从 Firebase 同步库存（跨设备同步）
+            await syncFromFirebase();
 
             const historySaved = localStorage.getItem(HISTORY_KEY);
             if (historySaved) {
@@ -1008,6 +1061,15 @@
         function drawLottery() {
             if (isDrawing) return;
 
+            // 检查是否已抽过奖（防止重复抽奖）
+            const userDrawn = localStorage.getItem(USER_DRAWN_KEY);
+            if (userDrawn === 'true') {
+                showToast('你已经抽过奖啦！每人限抽一次哦~', 'error');
+                document.getElementById('drawBtn').disabled = true;
+                document.getElementById('drawBtn').textContent = '✅ 已抽中';
+                return;
+            }
+
             const available = prizeData.filter(p => p.currentStock > 0);
             if (available.length === 0) {
                 showToast('😢 所有奖品已抽完！', 'error');
@@ -1040,15 +1102,29 @@
             }, 80);
 
             // 2秒后停止
-            setTimeout(() => {
+            setTimeout(async () => {
                 clearInterval(spinInterval);
                 prizeDisplay.classList.remove('spinning');
+
+                // 抽奖前再次同步最新库存（防止其他人已抽完）
+                await syncFromFirebase();
+                const available = prizeData.filter(p => p.currentStock > 0);
+                if (available.length === 0) {
+                    prizeName.textContent = '奖品已抽完';
+                    resultMessage.textContent = '😢 所有奖品已被抽完！';
+                    drawBtn.disabled = true;
+                    drawBtn.textContent = '😢 已抽完';
+                    isDrawing = false;
+                    return;
+                }
 
                 const winner = weightedRandomDraw();
                 if (winner) {
                     // 扣减库存
                     winner.currentStock--;
                     saveData();
+                    // 同步到云端（所有设备实时同步）
+                    await syncToFirebase();
 
                     // 记录历史
                     drawHistory.push({
@@ -1081,6 +1157,7 @@
                     updatePrizeGrid();
                     updateTotalStats();
                     updateRemainingPrizes();
+                    updateCoverStatus();
                 } else {
                     prizeName.textContent = '奖品已抽完';
                     resultMessage.textContent = '😢 所有奖品已抽完！';
@@ -1256,9 +1333,6 @@
 
         // ==================== 页面导航 ====================
         function showPage(pageId) {
-            if (isPublicMode && pageId === 'coverPage') {
-                pageId = 'lotteryPage';
-            }
             document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
             document.getElementById(pageId).classList.add('active');
             window.scrollTo(0, 0);
@@ -1587,21 +1661,33 @@
         }
 
         // ==================== 初始化 ====================
-        document.addEventListener('DOMContentLoaded', () => {
-            initData();
+        document.addEventListener('DOMContentLoaded', async () => {
+            await initData();
             createConfetti();
 
-            // 大众模式：隐藏后台管理入口和返回按钮
+            // 大众模式：隐藏后台管理入口和抽奖页返回按钮
             if (isPublicMode) {
                 const adminLink = document.querySelector('.admin-link');
                 if (adminLink) adminLink.style.display = 'none';
                 const backBtn = document.getElementById('lotteryBackBtn');
                 if (backBtn) backBtn.style.display = 'none';
-                // 直接进入抽奖页
-                goToLottery();
-            } else {
-                updateCoverStatus();
-                updateRemainingPrizes();
+            }
+            
+            // 无论管理员还是大众模式，都显示封面并更新状态
+            updateCoverStatus();
+            updateRemainingPrizes();
+
+            // 定时轮询：每 3 秒从 Firebase 同步库存（实现多设备实时同步）
+            if (FIREBASE_URL) {
+                setInterval(async () => {
+                    if (!isDrawing) {
+                        await syncFromFirebase();
+                        renderPrizeGrid();
+                        updateTotalStats();
+                        updateRemainingPrizes();
+                        updateCoverStatus();
+                    }
+                }, 3000);
             }
         });
     </script>
