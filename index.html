@@ -637,6 +637,29 @@
             margin-top: 5px;
         }
 
+        .sync-status {
+            margin-top: 15px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            background: #f7f7f7;
+            color: #666;
+            font-size: 13px;
+            line-height: 1.5;
+            border: 1px solid #eee;
+        }
+
+        .sync-status.ok {
+            background: #e8f5e9;
+            color: #2e7d32;
+            border-color: #c8e6c9;
+        }
+
+        .sync-status.error {
+            background: #ffebee;
+            color: #c62828;
+            border-color: #ffcdd2;
+        }
+
         .toast {
             position: fixed;
             bottom: 30px;
@@ -761,10 +784,6 @@
                 🎁 开始抽奖
             </button>
             <br>
-            <button class="btn-start" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); font-size: 16px; padding: 12px 35px;" onclick="showQRCode()">
-                📱 生成抽奖二维码
-            </button>
-            <br>
             <a class="admin-link" onclick="goToAdmin()">⚙️ 后台管理</a>
         </div>
     </div>
@@ -821,6 +840,7 @@
                     <div class="label">已抽出</div>
                 </div>
             </div>
+            <div class="sync-status" id="syncStatus">Firebase 同步状态：等待检测</div>
         </div>
 
         <div class="admin-panel">
@@ -833,6 +853,8 @@
         <div class="admin-panel">
             <h3 style="margin-bottom: 15px; color: #333;">快捷操作</h3>
             <div class="admin-actions">
+                <button class="btn-admin btn-primary" onclick="showQRCode()">📱 生成抽奖二维码</button>
+                <button class="btn-admin btn-secondary" onclick="testFirebaseSync()">🔎 测试实时同步</button>
                 <button class="btn-admin btn-primary" onclick="resetAllStock()">🔄 重置所有库存</button>
                 <button class="btn-admin btn-secondary" onclick="setEqualWeights()">⚖️ 一键设置等权重</button>
                 <button class="btn-admin btn-secondary" onclick="clearHistory()">🗑️ 清空抽奖记录</button>
@@ -921,9 +943,12 @@
         const COVER_IMAGE_KEY = 'dogLotteryCoverImage';
         const USER_DRAWN_KEY = 'dogLotteryUserDrawn';
         const USER_PRIZE_KEY = 'dogLotteryUserPrize';
+        const USER_ROUND_KEY = 'dogLotteryUserRound';
         const QR_URL_KEY = 'dogLotteryQRUrl';
         const ADMIN_PWD_KEY = 'dogLotteryAdminPwd';
         const SESSION_PWD_KEY = 'dogLotterySessionPwd';
+        const LOCAL_ROUND_KEY = 'dogLotteryRound';
+        const DEFAULT_LOTTERY_ROUND = 1;
 
         // 默认管理密码（修改此处即可更换密码）
         const DEFAULT_ADMIN_PWD = '260129';
@@ -938,18 +963,149 @@
         let prizeData = [];
         let drawHistory = [];
         let isDrawing = false;
+        let lotteryRound = Number(localStorage.getItem(LOCAL_ROUND_KEY)) || DEFAULT_LOTTERY_ROUND;
         const isPublicMode = new URLSearchParams(window.location.search).get('mode') === 'lottery';
 
         // ==================== Firebase 实时同步 ====================
-        async function syncFromFirebase() {
-            if (!FIREBASE_URL) return;
+        function firebaseEndpoint(path) {
+            return `${FIREBASE_URL}/${path}.json`;
+        }
+
+        async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
             try {
-                const resp = await fetch(`${FIREBASE_URL}/prizes.json?_=${Date.now()}`);
-                if (!resp.ok) return;
-                const data = await resp.json();
+                return await fetch(url, {
+                    ...options,
+                    signal: controller.signal
+                });
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        function formatSyncTime() {
+            return new Date().toLocaleTimeString('zh-CN', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+
+        function setSyncStatus(message, type = '') {
+            const status = document.getElementById('syncStatus');
+            if (!status) return;
+            status.textContent = message;
+            status.className = `sync-status ${type}`.trim();
+        }
+
+        function normalizeRound(value) {
+            const number = Number(value);
+            return Number.isFinite(number) && number > 0 ? Math.floor(number) : DEFAULT_LOTTERY_ROUND;
+        }
+
+        function clearExpiredDrawnStatus() {
+            if (localStorage.getItem(USER_DRAWN_KEY) !== 'true') return;
+            const userRound = normalizeRound(localStorage.getItem(USER_ROUND_KEY));
+            if (userRound !== lotteryRound) {
+                localStorage.removeItem(USER_DRAWN_KEY);
+                localStorage.removeItem(USER_PRIZE_KEY);
+                localStorage.removeItem(USER_ROUND_KEY);
+            }
+        }
+
+        function applyLotteryRound(nextRound) {
+            const previousRound = lotteryRound;
+            const normalizedRound = normalizeRound(nextRound);
+            if (localStorage.getItem(USER_DRAWN_KEY) === 'true' && !localStorage.getItem(USER_ROUND_KEY)) {
+                localStorage.setItem(USER_ROUND_KEY, String(previousRound));
+            }
+            lotteryRound = normalizedRound;
+            localStorage.setItem(LOCAL_ROUND_KEY, String(lotteryRound));
+            clearExpiredDrawnStatus();
+        }
+
+        function getLocalCoverImage() {
+            return localStorage.getItem(COVER_IMAGE_KEY) || '';
+        }
+
+        function applyCoverImage(base64Image) {
+            const placeholder = document.getElementById('coverDogImage');
+            if (base64Image) {
+                localStorage.setItem(COVER_IMAGE_KEY, base64Image);
+                if (placeholder) placeholder.innerHTML = `<img src="${base64Image}" alt="寿星小狗">`;
+            } else {
+                localStorage.removeItem(COVER_IMAGE_KEY);
+                if (placeholder) {
+                    placeholder.innerHTML = '<span>🐶</span><div class="placeholder-text">寿星小狗照片</div>';
+                }
+            }
+        }
+
+        function makeAppStatePayload() {
+            return {
+                lotteryRound,
+                coverImage: getLocalCoverImage(),
+                updatedAt: new Date().toISOString()
+            };
+        }
+
+        function applyAppState(state) {
+            if (!state || typeof state !== 'object') return;
+            applyLotteryRound(state.lotteryRound);
+            if (Object.prototype.hasOwnProperty.call(state, 'coverImage')) {
+                applyCoverImage(state.coverImage || '');
+            }
+        }
+
+        async function syncStateToFirebase({ silent = false } = {}) {
+            if (!FIREBASE_URL) {
+                setSyncStatus('Firebase 同步状态：未配置数据库地址', 'error');
+                return false;
+            }
+            try {
+                if (!silent) setSyncStatus('Firebase 同步状态：正在写入全局设置...');
+                const resp = await fetchWithTimeout(firebaseEndpoint('appState'), {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(makeAppStatePayload())
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                if (!silent) setSyncStatus(`Firebase 同步状态：全局设置已更新（${formatSyncTime()}）`, 'ok');
+                return true;
+            } catch (e) {
+                console.warn('Firebase 全局设置写入失败:', e);
+                setSyncStatus('Firebase 同步状态：全局设置写入失败，请检查数据库规则和 URL', 'error');
+                return false;
+            }
+        }
+
+        async function syncFromFirebase({ silent = false } = {}) {
+            if (!FIREBASE_URL) {
+                setSyncStatus('Firebase 同步状态：未配置数据库地址', 'error');
+                return false;
+            }
+            try {
+                if (!silent) setSyncStatus('Firebase 同步状态：正在读取云端数据...');
+                const [stateResp, prizeResp] = await Promise.all([
+                    fetchWithTimeout(`${firebaseEndpoint('appState')}?_=${Date.now()}`),
+                    fetchWithTimeout(`${firebaseEndpoint('prizes')}?_=${Date.now()}`)
+                ]);
+                if (!stateResp.ok) throw new Error(`appState HTTP ${stateResp.status}`);
+                if (!prizeResp.ok) throw new Error(`prizes HTTP ${prizeResp.status}`);
+
+                const state = await stateResp.json();
+                if (state) {
+                    applyAppState(state);
+                } else {
+                    await syncStateToFirebase({ silent: true });
+                }
+
+                const data = await prizeResp.json();
                 if (data && Array.isArray(data) && data.length === prizeData.length) {
                     data.forEach((item, i) => {
                         if (prizeData[i] && item) {
+                            if (item.name !== undefined) prizeData[i].name = item.name;
                             if (item.currentStock !== undefined) prizeData[i].currentStock = item.currentStock;
                             if (item.totalStock !== undefined) prizeData[i].totalStock = item.totalStock;
                             if (item.weight !== undefined) prizeData[i].weight = item.weight;
@@ -958,29 +1114,78 @@
                     saveData();
                 } else if (FIREBASE_URL) {
                     // Firebase 首次无数据，初始化写入
-                    await syncToFirebase();
+                    await syncToFirebase({ silent: true });
                 }
+                clearExpiredDrawnStatus();
+                if (!silent) setSyncStatus(`Firebase 同步状态：已连接并同步（${formatSyncTime()}）`, 'ok');
+                return true;
             } catch (e) {
                 console.warn('Firebase 读取失败:', e);
+                setSyncStatus('Firebase 同步状态：读取失败，请检查数据库 URL、规则或网络', 'error');
+                return false;
             }
         }
 
-        async function syncToFirebase() {
-            if (!FIREBASE_URL) return;
+        async function syncToFirebase({ includeState = false, silent = false } = {}) {
+            if (!FIREBASE_URL) {
+                setSyncStatus('Firebase 同步状态：未配置数据库地址', 'error');
+                return false;
+            }
             try {
                 const payload = prizeData.map(p => ({
                     id: p.id,
+                    name: p.name,
                     currentStock: p.currentStock,
                     totalStock: p.totalStock,
                     weight: p.weight
                 }));
-                await fetch(`${FIREBASE_URL}/prizes.json`, {
+                if (!silent) setSyncStatus('Firebase 同步状态：正在写入奖品数据...');
+                const resp = await fetchWithTimeout(firebaseEndpoint('prizes'), {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                if (includeState) {
+                    await syncStateToFirebase({ silent: true });
+                }
+                if (!silent) setSyncStatus(`Firebase 同步状态：奖品数据已更新（${formatSyncTime()}）`, 'ok');
+                return true;
             } catch (e) {
                 console.warn('Firebase 写入失败:', e);
+                setSyncStatus('Firebase 同步状态：写入失败，请检查数据库规则和 URL', 'error');
+                return false;
+            }
+        }
+
+        async function testFirebaseSync() {
+            if (!FIREBASE_URL) {
+                setSyncStatus('Firebase 同步状态：未配置数据库地址', 'error');
+                showToast('请先配置 Firebase 数据库地址', 'error');
+                return;
+            }
+            const marker = Date.now();
+            try {
+                setSyncStatus('Firebase 同步状态：正在测试读写...');
+                const writeResp = await fetchWithTimeout(firebaseEndpoint('syncTest'), {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ marker, time: new Date().toISOString() })
+                });
+                if (!writeResp.ok) throw new Error(`write HTTP ${writeResp.status}`);
+
+                const readResp = await fetchWithTimeout(`${firebaseEndpoint('syncTest')}?_=${Date.now()}`);
+                if (!readResp.ok) throw new Error(`read HTTP ${readResp.status}`);
+                const result = await readResp.json();
+                if (!result || result.marker !== marker) throw new Error('marker mismatch');
+
+                await syncFromFirebase({ silent: true });
+                setSyncStatus(`Firebase 同步状态：读写测试成功（${formatSyncTime()}）`, 'ok');
+                showToast('✅ Firebase 实时同步可用', 'success');
+            } catch (e) {
+                console.warn('Firebase 同步测试失败:', e);
+                setSyncStatus('Firebase 同步状态：读写测试失败，请检查数据库规则和 URL', 'error');
+                showToast('Firebase 同步测试失败', 'error');
             }
         }
 
@@ -1058,8 +1263,14 @@
         }
 
         // 执行抽奖
-        function drawLottery() {
+        async function drawLottery() {
             if (isDrawing) return;
+            const synced = await syncFromFirebase({ silent: true });
+            if (!synced) {
+                showToast('云端同步失败，请稍后再试', 'error');
+                return;
+            }
+            clearExpiredDrawnStatus();
 
             // 检查是否已抽过奖（防止重复抽奖）
             const userDrawn = localStorage.getItem(USER_DRAWN_KEY);
@@ -1124,7 +1335,17 @@
                     winner.currentStock--;
                     saveData();
                     // 同步到云端（所有设备实时同步）
-                    await syncToFirebase();
+                    const synced = await syncToFirebase({ silent: true });
+                    if (!synced) {
+                        winner.currentStock++;
+                        saveData();
+                        prizeName.textContent = '同步失败';
+                        resultMessage.textContent = '云端库存没有更新成功，请重新抽奖。';
+                        drawBtn.disabled = false;
+                        drawBtn.textContent = '🎲 重新抽奖';
+                        isDrawing = false;
+                        return;
+                    }
 
                     // 记录历史
                     drawHistory.push({
@@ -1141,6 +1362,7 @@
                         name: winner.name,
                         image: winner.image
                     }));
+                    localStorage.setItem(USER_ROUND_KEY, String(lotteryRound));
 
                     // 显示结果
                     prizeImage.src = winner.image;
@@ -1163,9 +1385,8 @@
                     resultMessage.textContent = '😢 所有奖品已抽完！';
                 }
 
-                drawBtn.disabled = false;
-                drawBtn.textContent = '🎲 再抽一次';
                 isDrawing = false;
+                updateLotteryDrawState();
             }, 2000);
         }
 
@@ -1245,63 +1466,76 @@
             });
         }
 
-        function updatePrizeName(id, name) {
+        async function updatePrizeName(id, name) {
             const prize = prizeData.find(p => p.id === id);
             if (prize) {
                 prize.name = name;
                 saveData();
+                await syncToFirebase();
+                renderPrizeGrid();
             }
         }
 
-        function updateTotalStock(id, value) {
+        async function updateTotalStock(id, value) {
             const prize = prizeData.find(p => p.id === id);
             if (prize) {
                 prize.totalStock = parseInt(value) || 0;
                 saveData();
+                await syncToFirebase();
                 updateTotalStats();
+                updateRemainingPrizes();
+                updateCoverStatus();
                 renderAdminTable();
             }
         }
 
-        function updateCurrentStock(id, value) {
+        async function updateCurrentStock(id, value) {
             const prize = prizeData.find(p => p.id === id);
             if (prize) {
                 prize.currentStock = parseInt(value) || 0;
                 saveData();
+                await syncToFirebase();
                 updateTotalStats();
+                updateRemainingPrizes();
+                updateCoverStatus();
                 renderAdminTable();
             }
         }
 
-        function updateWeight(id, value) {
+        async function updateWeight(id, value) {
             const prize = prizeData.find(p => p.id === id);
             if (prize) {
                 prize.weight = parseInt(value) || 1;
                 saveData();
+                await syncToFirebase();
             }
         }
 
         // 重置所有库存
-        function resetAllStock() {
+        async function resetAllStock() {
             if (!confirm('确定要重置所有库存吗？所有奖品将恢复为初始库存数量。')) return;
             prizeData.forEach(prize => {
                 prize.currentStock = prize.totalStock;
             });
             saveData();
+            const synced = await syncToFirebase();
             updateTotalStats();
+            updateRemainingPrizes();
+            updateCoverStatus();
             renderAdminTable();
-            showToast('🔄 库存已重置', 'success');
+            showToast(synced ? '🔄 库存已重置并同步' : '库存已本地重置，但云端同步失败', synced ? 'success' : 'error');
         }
 
         // 一键设置等权重
-        function setEqualWeights() {
+        async function setEqualWeights() {
             const weight = parseInt(prompt('请输入等权重值（默认1）：', '1')) || 1;
             prizeData.forEach(prize => {
                 prize.weight = weight;
             });
             saveData();
+            const synced = await syncToFirebase();
             renderAdminTable();
-            showToast(`⚖️ 所有奖品权重已设置为 ${weight}`, 'success');
+            showToast(synced ? `⚖️ 所有奖品权重已设置为 ${weight}` : '权重已本地修改，但云端同步失败', synced ? 'success' : 'error');
         }
 
         // 清空抽奖记录
@@ -1313,8 +1547,8 @@
         }
 
         // 恢复默认设置
-        function resetToDefault() {
-            if (!confirm('⚠️ 确定要恢复默认设置吗？所有名称、库存、权重都将重置！')) return;
+        async function resetToDefault() {
+            if (!confirm('⚠️ 确定要恢复默认设置吗？所有名称、库存、权重都会重置，所有设备也会重新获得抽奖资格。')) return;
             prizeData = PRIZE_IMAGES.map((img, i) => ({
                 id: i,
                 name: DEFAULT_PRIZE_NAMES[i] || `奖品 ${i + 1}`,
@@ -1324,11 +1558,19 @@
                 weight: 1
             }));
             drawHistory = [];
+            lotteryRound += 1;
+            localStorage.setItem(LOCAL_ROUND_KEY, String(lotteryRound));
+            localStorage.removeItem(USER_DRAWN_KEY);
+            localStorage.removeItem(USER_PRIZE_KEY);
+            localStorage.removeItem(USER_ROUND_KEY);
             saveData();
             saveHistory();
+            const synced = await syncToFirebase({ includeState: true });
             updateTotalStats();
+            updateRemainingPrizes();
+            updateCoverStatus();
             renderAdminTable();
-            showToast('✅ 已恢复默认设置', 'success');
+            showToast(synced ? '✅ 已恢复默认设置并重置所有抽奖资格' : '默认设置已本地恢复，但云端同步失败', synced ? 'success' : 'error');
         }
 
         // ==================== 页面导航 ====================
@@ -1343,11 +1585,24 @@
             updateCoverStatus();
         }
 
+        function applyPublicModeVisibility() {
+            if (!isPublicMode) return;
+            const adminLink = document.querySelector('.admin-link');
+            if (adminLink) adminLink.style.display = 'none';
+            const backBtn = document.getElementById('lotteryBackBtn');
+            if (backBtn) backBtn.style.display = 'none';
+        }
+
         function goToLottery() {
+            clearExpiredDrawnStatus();
             showPage('lotteryPage');
             renderPrizeGrid();
             updateTotalStats();
             updateRemainingPrizes();
+            document.getElementById('resultMessage').textContent = '';
+            document.getElementById('resultMessage').classList.remove('winner');
+            document.getElementById('drawBtn').disabled = false;
+            document.getElementById('drawBtn').textContent = '🎲 立即抽奖';
 
             // 检查用户是否已抽奖
             const userDrawn = localStorage.getItem(USER_DRAWN_KEY);
@@ -1438,7 +1693,29 @@
         }
 
         // ==================== 二维码 ====================
+        function hasAdminSession() {
+            return !isPublicMode && sessionStorage.getItem(SESSION_PWD_KEY) === 'verified';
+        }
+
+        function makePublicLotteryUrl(rawUrl) {
+            try {
+                const target = new URL(rawUrl || window.location.href, window.location.href);
+                target.searchParams.set('mode', 'lottery');
+                return target.href;
+            } catch {
+                let url = rawUrl || window.location.href;
+                if (!url.includes('mode=lottery')) {
+                    url += (url.includes('?') ? '&' : '?') + 'mode=lottery';
+                }
+                return url;
+            }
+        }
+
         function showQRCode() {
+            if (!hasAdminSession()) {
+                showToast('只有管理员可以生成二维码', 'error');
+                return;
+            }
             const modal = document.getElementById('qrModal');
             const qrcodeDiv = document.getElementById('qrcode');
             const urlInput = document.getElementById('qrUrlInput');
@@ -1467,6 +1744,10 @@
         }
 
         function generateQRCode() {
+            if (!hasAdminSession()) {
+                showToast('只有管理员可以生成二维码', 'error');
+                return;
+            }
             const qrcodeDiv = document.getElementById('qrcode');
             const urlInput = document.getElementById('qrUrlInput');
             qrcodeDiv.innerHTML = '';
@@ -1477,10 +1758,9 @@
             }
             if (!url) return;
 
-            // 大众模式二维码：URL加上 mode=lottery
-            if (!url.includes('mode=lottery')) {
-                url += (url.includes('?') ? '&' : '?') + 'mode=lottery';
-            }
+            // 大众模式二维码：URL 使用 mode=lottery，扫码后先进入封面，再点击开始抽奖。
+            url = makePublicLotteryUrl(url);
+            urlInput.value = url;
 
             // 保存URL
             if (url !== window.location.href) {
@@ -1542,6 +1822,7 @@
 
         // ==================== 封面状态更新 ====================
         function updateCoverStatus() {
+            clearExpiredDrawnStatus();
             const remaining = getRemainingCount();
             const coverRemaining = document.getElementById('coverRemainingPrizes');
             const coverAlreadyDrawn = document.getElementById('coverAlreadyDrawn');
@@ -1577,13 +1858,47 @@
             }
         }
 
+        function updateLotteryDrawState() {
+            const lotteryPage = document.getElementById('lotteryPage');
+            if (!lotteryPage || !lotteryPage.classList.contains('active') || isDrawing) return;
+            clearExpiredDrawnStatus();
+
+            const drawBtn = document.getElementById('drawBtn');
+            const resultMessage = document.getElementById('resultMessage');
+            const userDrawn = localStorage.getItem(USER_DRAWN_KEY);
+            const available = prizeData.filter(p => p.currentStock > 0);
+
+            if (userDrawn === 'true') {
+                drawBtn.disabled = true;
+                drawBtn.textContent = '✅ 已抽中';
+                return;
+            }
+
+            if (available.length === 0) {
+                drawBtn.disabled = true;
+                drawBtn.textContent = '😢 已抽完';
+                return;
+            }
+
+            drawBtn.disabled = false;
+            drawBtn.textContent = '🎲 立即抽奖';
+            if (resultMessage && !resultMessage.classList.contains('winner')) {
+                resultMessage.textContent = '';
+            }
+        }
+
         // ==================== 重置所有抽奖资格 ====================
-        function resetAllDrawnStatus() {
+        async function resetAllDrawnStatus() {
             if (!confirm('♻️ 确定要重置所有抽奖资格吗？所有用户将可以重新抽奖。')) return;
+            lotteryRound += 1;
+            localStorage.setItem(LOCAL_ROUND_KEY, String(lotteryRound));
             localStorage.removeItem(USER_DRAWN_KEY);
             localStorage.removeItem(USER_PRIZE_KEY);
-            showToast('♻️ 所有抽奖资格已重置', 'success');
+            localStorage.removeItem(USER_ROUND_KEY);
+            const synced = await syncStateToFirebase();
+            showToast(synced ? '♻️ 已重置所有设备抽奖资格' : '抽奖资格已本地重置，但云端同步失败', synced ? 'success' : 'error');
             updateCoverStatus();
+            updateLotteryDrawState();
         }
 
         // ==================== 修改管理密码 ====================
@@ -1628,10 +1943,9 @@
 
         // ==================== 封面图片设置 ====================
         // 提供API给外部设置封面图片（base64）
-        function setCoverImage(base64Image) {
-            localStorage.setItem(COVER_IMAGE_KEY, base64Image);
-            const placeholder = document.getElementById('coverDogImage');
-            placeholder.innerHTML = `<img src="${base64Image}" alt="寿星小狗">`;
+        async function setCoverImage(base64Image) {
+            applyCoverImage(base64Image);
+            await syncStateToFirebase();
         }
 
         function handleCoverImageUpload(input) {
@@ -1662,16 +1976,12 @@
 
         // ==================== 初始化 ====================
         document.addEventListener('DOMContentLoaded', async () => {
+            applyPublicModeVisibility();
             await initData();
             createConfetti();
 
             // 大众模式：隐藏后台管理入口和抽奖页返回按钮
-            if (isPublicMode) {
-                const adminLink = document.querySelector('.admin-link');
-                if (adminLink) adminLink.style.display = 'none';
-                const backBtn = document.getElementById('lotteryBackBtn');
-                if (backBtn) backBtn.style.display = 'none';
-            }
+            applyPublicModeVisibility();
             
             // 无论管理员还是大众模式，都显示封面并更新状态
             updateCoverStatus();
@@ -1686,6 +1996,7 @@
                         updateTotalStats();
                         updateRemainingPrizes();
                         updateCoverStatus();
+                        updateLotteryDrawState();
                     }
                 }, 3000);
             }
